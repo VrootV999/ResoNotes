@@ -1,5 +1,6 @@
 mod config;
 mod ctl;
+mod dialog;
 mod ipc;
 mod python;
 mod recorder;
@@ -13,15 +14,55 @@ use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use log::LevelFilter;
 use notify_rust::Notification;
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Sender};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecMode {
+    Standalone,
+    Session,
+}
+
+impl RecMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            RecMode::Standalone => "standalone",
+            RecMode::Session => "session",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Ev {
-    Toggle,
-    NewSession,
+    Toggle, // start/stop recording (standalone, or the active session's take)
+    Session, // (re)open/create session, or stop the current session
     OpenNotes,
     Quit,
+}
+
+/// What the currently active take is about (for stop-time naming).
+#[derive(Debug, Clone)]
+struct ActiveTake {
+    mode: RecMode,
+    safe: String,
+}
+
+/// An open session: takes in the same session share folder `<notes>/<safe>`
+/// and combined notes `<notes>/<safe>/summary.md` + notes.md + topic files.
+#[derive(Debug, Clone)]
+struct SessionCtx {
+    display: String,
+    safe: String,
+}
+
+/// Offline queue entry kept in memory while the backend is unreachable.
+#[derive(Debug, Clone)]
+struct PendingTake {
+    path: PathBuf,
+    take_id: String,
+    kind: &'static str,
+    name: String,
 }
 
 struct App {
@@ -30,8 +71,10 @@ struct App {
     recorder: Recorder,
     status: crate::ctl::Status,
     tray: Option<Tray>,
-    pending: Vec<(std::path::PathBuf, String)>,
+    pending: Vec<PendingTake>,
     take_seq: u64,
+    session: Option<SessionCtx>,
+    active: Option<ActiveTake>,
 }
 
 fn notify(summary: &str, body: &str) {
@@ -124,7 +167,7 @@ fn main() {
         #[cfg(unix)]
         {
             match args[1].as_str() {
-                "toggle" | "status" | "new_session" | "quit" => {
+                "toggle" | "session" | "status" | "quit" => {
                     match crate::ctl::client(&args[1]) {
                         Ok(reply) => {
                             println!("{reply}");
@@ -152,17 +195,21 @@ fn main() {
 
     let mut app = App::assemble(cfg, status, tx);
 
-    let _manager = register_hotkey();
-    if app.cfg.tts_feedback {
-        app.supervisor.backend().say("ResoNote is ready");
-    }
+    let hotkeys = register_hotkey();
 
     let mut last_retry = Instant::now();
     loop {
         // global hotkey (X11/XWayland)
         while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
-            if ev.state == HotKeyState::Pressed {
-                app.handle(Ev::Toggle);
+            if ev.state != HotKeyState::Pressed {
+                continue;
+            }
+            if let Some(hk) = &hotkeys {
+                if hk.toggle_ids.contains(&ev.id) {
+                    app.handle(Ev::Toggle);
+                } else if ev.id == hk.session_id {
+                    app.handle(Ev::Session);
+                }
             }
         }
         while let Ok(ev) = rx.try_recv() {
@@ -215,65 +262,201 @@ impl App {
             tray,
             pending: Vec::new(),
             take_seq: 0,
+            session: None,
+            active: None,
         }
     }
 
     fn handle(&mut self, ev: Ev) {
         match ev {
             Ev::Toggle => self.toggle(),
-            Ev::NewSession => self.new_session(),
+            Ev::Session => self.session_action(),
             Ev::OpenNotes => self.open_notes(),
             Ev::Quit => self.quit(),
         }
         self.tray_refresh();
     }
 
+    /// SUPER+S: toggle recording. Already recording -> stop and hand the take
+    /// to the backend. Otherwise start a take: into the active session if we
+    /// are inside one, else a standalone note (name asked first).
     fn toggle(&mut self) {
-        if self.recorder.is_recording() {
-            let stem = format!("take-{}-{:03}", stamp(), self.take_seq);
-            match self.recorder.stop(&self.cfg.recordings_dir, &stem) {
-                Some((path, dur)) => {
-                    self.take_seq += 1;
-                    self.status.set_recording(false);
-                    self.tray_refresh();
-                    notify(
-                        "Recording saved",
-                        &format!("{} ({:.0}s) — processing…", path.file_name().unwrap().to_string_lossy(), dur),
-                    );
-                    if self.cfg.tts_feedback {
-                        self.supervisor.backend().say("Recording finished");
-                    }
-                    self.submit(path, stem);
+        if self.active.is_some() {
+            self.stop_take(true);
+            return;
+        }
+
+        // Starting a new take: ask for the standalone note name only when we
+        // are not inside a session (a session take already has its name).
+        let (display, safe, mode) = if let Some(s) = self.session.clone() {
+            (s.display.clone(), s.safe.clone(), RecMode::Session)
+        } else {
+            let (d, sf) = match dialog::prompt_name(
+                "ResoNote — Standalone note",
+                "Save note as (blank = date & time):",
+            ) {
+                Some(n) => {
+                    let safe = crate::config::safe_name(&n);
+                    (n, safe)
                 }
                 None => {
-                    self.status.set_recording(false);
-                    notify("ResoNote", "Take was too short or mic failed.");
+                    let s = stamp();
+                    (s.clone(), s)
                 }
+            };
+            (d, sf, RecMode::Standalone)
+        };
+
+        match self.recorder.start(&self.cfg) {
+            Ok(()) => {
+                self.active = Some(ActiveTake { mode, safe });
+                self.status.set_recording(true);
+                self.status.set_mode(Some(mode.as_str()));
+                notify(
+                    "ResoNote",
+                    &format!("Recording started — {} ({display})", mode.as_str()),
+                );
             }
-        } else {
-            match self.recorder.start(&self.cfg) {
-                Ok(()) => {
-                    self.status.set_recording(true);
-                    if self.cfg.tts_feedback {
-                        self.supervisor.backend().say("Recording started");
-                    }
-                }
-                Err(e) => notify("ResoNote", &format!("Could not start mic: {e}")),
+            Err(e) => {
+                notify("ResoNote", &format!("Could not start mic: {e}"));
             }
         }
     }
 
-    fn submit(&mut self, path: std::path::PathBuf, take_id: String) {
+    /// SUPER+SHIFT+J: session control. If recording, first stop the current
+    /// take. If a session is open, close it (its recordings & notes stay).
+    /// Otherwise ask whether to create a new session or load an old one.
+    fn session_action(&mut self) {
+        if self.active.is_some() {
+            self.stop_take(self.session.is_some());
+        }
+        if let Some(s) = self.session.take() {
+            self.status.set_recording(false);
+            self.status.set_mode(None);
+            notify(
+                "Session stopped",
+                &format!("'{}' is closed. Its recordings are in the notes folder.", s.display),
+            );
+            return;
+        }
+        let choices: Vec<String> = vec!["Create new session".into(), "Load existing session".into()];
+        match dialog::picker(
+            "ResoNote — Session",
+            "New session or load an old one?",
+            &choices,
+        ) {
+            Some(0) => {
+                let (display, safe) = match dialog::prompt_name(
+                    "ResoNote — New session",
+                    "Name this session (blank = date & time):",
+                ) {
+                    Some(n) => (n.clone(), crate::config::safe_name(&n)),
+                    None => {
+                        let s = stamp();
+                        (s.clone(), s)
+                    }
+                };
+                self.session = Some(SessionCtx { display, safe });
+                notify(
+                    "Session started",
+                    "Recording now saves into this session. Press SUPER+S to start.",
+                );
+            }
+            Some(1) => {
+                if let Some((display, safe)) = self.choose_session() {
+                    let d = display.clone();
+                    self.session = Some(SessionCtx { display, safe });
+                    notify(
+                        "Session loaded",
+                        &format!("Recording now continues the session '{d}'."),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// List past sessions (folders under the notes dir) and let the user pick.
+    fn choose_session(&self) -> Option<(String, String)> {
+        let mut folders: Vec<PathBuf> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.cfg.notes_dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() && p.join("summary.md").exists() {
+                    folders.push(p);
+                }
+            }
+        }
+        folders.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH));
+        folders.reverse();
+        if folders.is_empty() {
+            notify("ResoNote", "No past sessions found in the notes folder yet.");
+            return None;
+        }
+        let names: Vec<String> = folders
+            .iter()
+            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+            .collect();
+        match dialog::picker("ResoNote — Load session", "Pick a session:", &names) {
+            Some(i) if i < names.len() => {
+                let safe = names[i].clone();
+                Some((safe.clone(), safe))
+            }
+            _ => None,
+        }
+    }
+
+    /// Save the active take, then submit it.
+    fn stop_take(&mut self, submit: bool) {
+        let Some(active) = self.active.take() else {
+            self.status.set_recording(false);
+            return;
+        };
+        let stem = format!("take-{}-{:03}", stamp(), self.take_seq);
+        let dir = match active.mode {
+            // Session recordings live inside the session folder (notes/<safe>)
+            RecMode::Session => self.cfg.notes_dir.join(&active.safe),
+            RecMode::Standalone => self.cfg.recordings_dir.clone(),
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::warn!("could not create {}: {e}", dir.display());
+        }
+        match self.recorder.stop(&dir, &stem) {
+            Some((path, dur)) => {
+                self.take_seq += 1;
+                self.status.set_recording(false);
+                self.status.set_mode(None);
+                notify(
+                    "Recording saved",
+                    &format!("{} ({dur:.0}s) — processing…", path.file_name().unwrap().to_string_lossy()),
+                );
+                if submit {
+                    self.submit(path, stem, active.mode, active.safe);
+                }
+            }
+            None => {
+                self.status.set_recording(false);
+                self.status.set_mode(None);
+                notify("ResoNote", "Take was too short or mic failed.");
+            }
+        }
+    }
+
+    fn submit(&mut self, path: PathBuf, take_id: String, mode: RecMode, name: String) {
+        let kind = mode.as_str();
         if self.supervisor.backend().health() {
             let _ = self.status.set_backend(true);
-            if self.supervisor.backend().process_file(&path, &take_id) {
+            if self.supervisor.backend().process_file(&path, &take_id, kind, &name) {
                 return;
             }
         }
         self.status.set_backend(false);
         log::info!("queueing {} for offline retry", path.display());
-        self.pending.push((path, take_id));
-        let _ = self.supervisor.backend().say("Note is queued offline. It will sync when the network returns.");
+        self.pending.push(PendingTake { path, take_id, kind, name });
+        let _ = self
+            .supervisor
+            .backend()
+            .say("Note is queued offline. It will sync when the network returns.");
     }
 
     fn retry_pending(&mut self) {
@@ -286,20 +469,16 @@ impl App {
         }
         self.status.set_backend(true);
         let mut remaining = Vec::new();
-        for (path, take_id) in self.pending.drain(..) {
-            if !self.supervisor.backend().process_file(&path, &take_id) {
-                remaining.push((path, take_id));
+        for t in self.pending.drain(..) {
+            if !self
+                .supervisor
+                .backend()
+                .process_file(&t.path, &t.take_id, t.kind, &t.name)
+            {
+                remaining.push(t);
             }
         }
         self.pending = remaining;
-    }
-
-    fn new_session(&mut self) {
-        if self.recorder.is_recording() {
-            self.toggle();
-        }
-        let _ = self.supervisor.backend().new_session();
-        notify("ResoNote", "New note session started.");
     }
 
     fn open_notes(&self) {
@@ -309,30 +488,54 @@ impl App {
     }
 
     fn quit(&mut self) {
-        if self.recorder.is_recording() {
-            let stem = format!("take-{}-{:03}", stamp(), self.take_seq);
-            let _ = self.recorder.stop(&self.cfg.recordings_dir, &stem);
+        if self.active.is_some() {
+            self.stop_take(false);
         }
         self.supervisor.shutdown();
         notify("ResoNote", "Goodbye.");
     }
 }
 
-fn register_hotkey() -> Option<GlobalHotKeyManager> {
+struct Hotkeys {
+    _manager: GlobalHotKeyManager,
+    toggle_ids: Vec<u32>,
+    session_id: u32,
+}
+
+fn register_hotkey() -> Option<Hotkeys> {
     let manager = GlobalHotKeyManager::new().ok()?;
-    let hotkey = HotKey::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyJ);
-    match manager.register(hotkey) {
+
+    let mut toggle_ids = Vec::new();
+    let mut session_id: Option<u32> = None;
+
+    let toggle = HotKey::new(Some(Modifiers::SUPER), Code::KeyS);
+    match manager.register(toggle) {
         Ok(()) => {
-            log::info!("registered global hotkey SUPER+SHIFT+J");
-            Some(manager)
+            log::info!("registered global hotkey SUPER+S (record)");
+            toggle_ids.push(toggle.id());
         }
-        Err(e) => {
-            log::warn!("could not register global hotkey (XWayland/X11 required): {e}");
-            notify(
-                "ResoNote",
-                "Global hotkey unavailable on this session. Use the tray icon, or 'resonote toggle'.",
-            );
-            None
-        }
+        Err(e) => log::warn!("could not register SUPER+S: {e}"),
     }
+    let session = HotKey::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyJ);
+    match manager.register(session) {
+        Ok(()) => {
+            log::info!("registered global hotkey SUPER+SHIFT+J (session)");
+            session_id = Some(session.id());
+        }
+        Err(e) => log::warn!("could not register SUPER+SHIFT+J: {e}"),
+    }
+
+    if toggle_ids.is_empty() && session_id.is_none() {
+        notify(
+            "ResoNote",
+            "Global hotkeys unavailable (X11/XWayland required). Use the tray icon or 'resonote toggle'.",
+        );
+        return None;
+    }
+
+    Some(Hotkeys {
+        _manager: manager,
+        toggle_ids,
+        session_id: session_id.unwrap_or(0),
+    })
 }

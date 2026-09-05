@@ -3,9 +3,11 @@
 Serves 127.0.0.1 only. Rust (the tray app) launches this process, then:
     POST /api/process_file  submit a recorded take for processing
     POST /api/say           fire-and-forget TTS feedback
-    POST /api/new_session   force a fresh note session
     GET  /api/health        liveness
     POST /api/quit          graceful shutdown
+
+`kind` is "standalone" (one take -> one note) or "session" (takes grouped
+under `name` into one combined note). Rust asks the user for `name`.
 """
 
 from __future__ import annotations
@@ -20,20 +22,19 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 import config
-import notes
 import pipeline
 import tts
 
 log = logging.getLogger("resonote")
 
-app = FastAPI(title="ResoNote backend", version="0.1.0")
-
-ALLOWED_ROOT = "auto"
+app = FastAPI(title="ResoNote backend", version="0.2.0")
 
 
 class ProcessRequest(BaseModel):
     path: str
     take_id: Optional[str] = ""
+    kind: Optional[str] = "standalone"
+    name: Optional[str] = ""
 
 
 class SayRequest(BaseModel):
@@ -49,14 +50,23 @@ def health() -> dict:
 def process_file(body: ProcessRequest) -> dict:
     cfg = config.load()
     p = Path(body.path).expanduser().resolve()
-    root = cfg.recordings_dir.resolve()
-    if root != p.parent and p.parent != cfg.queue_dir.resolve():
+    rec_root = cfg.recordings_dir.resolve()
+    que_root = cfg.queue_dir.resolve()
+    notes_root = cfg.notes_dir.resolve()
+    allowed = p.is_relative_to(rec_root) or p.is_relative_to(que_root)
+    if not allowed and notes_root in p.parents:
+        allowed = True  # session recordings live in <notes>/<session>/
+    if not allowed:
         log.warning("rejecting path outside recorded dirs: %s", p)
         raise HTTPException(status_code=403, detail="path not allowed")
     take = (body.take_id or "").strip()
     if not take or not take.isascii() or any(c in take for c in "/\\ "):
         take = p.stem
-    status = pipeline.schedule(str(p), take)
+    kind = body.kind or "standalone"
+    if kind not in ("standalone", "session"):
+        kind = "standalone"
+    name = (body.name or "").strip()
+    status = pipeline.schedule(str(p), take, kind, name)
     return {"status": status}
 
 
@@ -64,12 +74,6 @@ def process_file(body: ProcessRequest) -> dict:
 def say(body: SayRequest) -> dict:
     tts.say(body.text or "")
     return {"ok": True}
-
-
-@app.post("/api/new_session")
-def new_session() -> dict:
-    stamp = notes.SessionStore(config.load()).reset()
-    return {"ok": True, "session": stamp}
 
 
 @app.post("/api/quit")

@@ -3,7 +3,7 @@
 Reads ~/.config/resonote/config.json (if present) and lets environment
 variables override the two required API keys. Everything ships free / $0:
     - STT :  Groq  (whisper-large-v3-turbo, free tier)
-    - LLM :  Google Gemini (gemini-2.0-flash, free tier)
+    - LLM :  Google Gemini (gemini-3.6-flash, free tier)
     - TTS :  edge-tts (Microsoft neural voices, no key required)
 """
 
@@ -58,7 +58,9 @@ class Config:
         self.voice = str(blob.get("voice", "en-US-AriaNeural"))
         self.language = str(blob.get("language", "en"))
         self.groq_model = str(blob.get("groq_stt_model", "whisper-large-v3-turbo"))
-        self.gemini_model = str(blob.get("gemini_model", "gemini-2.0-flash"))
+        self.llm_provider = str(blob.get("llm_provider", "groq")).lower()
+        self.llm_model = str(blob.get("llm_model", "qwen/qwen3.8-27b"))
+        self.gemini_model = str(blob.get("gemini_model", "gemini-3.6-flash"))
         self.chunk_minutes = int(blob.get("chunk_minutes", 8))
         self.session_merge_minutes = int(blob.get("session_merge_minutes", 10))
         self.speaker_diarization = bool(blob.get("speaker_diarization", True))

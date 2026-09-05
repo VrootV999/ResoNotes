@@ -35,21 +35,21 @@ impl Backend {
             .is_ok()
     }
 
-    pub fn new_session(&self) -> bool {
-        self.agent
-            .post(&format!("{}/api/new_session", self.base))
-            .send_json(serde_json::json!({}))
-            .is_ok()
-    }
-
-    pub fn process_file(&self, path: &Path, take_id: &str) -> bool {
-        log::info!("submit {} as {take_id}", path.display());
-        match self.agent.post(&format!("{}/api/process_file", self.base)).send_json(
-            serde_json::json!({
+    pub fn process_file(&self, path: &Path, take_id: &str, kind: &str, name: &str) -> bool {
+        log::info!(
+            "submit {} as {take_id} ({kind}, name={name})",
+            path.display()
+        );
+        match self
+            .agent
+            .post(&format!("{}/api/process_file", self.base))
+            .send_json(serde_json::json!({
                 "path": path.to_string_lossy().to_string(),
                 "take_id": take_id,
-            }),
-        ) {
+                "kind": kind,
+                "name": name,
+            }))
+        {
             Ok(r) => {
                 if r.status() == 200 {
                     log::info!("backend accepted {take_id}");

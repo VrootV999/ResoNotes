@@ -26,10 +26,6 @@ impl Recorder {
         }
     }
 
-    pub fn is_recording(&self) -> bool {
-        *self.active.lock().unwrap()
-    }
-
     pub fn start(&mut self, cfg: &Config) -> Result<(), String> {
         let host = cpal::default_host();
         let device = host

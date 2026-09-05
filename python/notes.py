@@ -1,15 +1,22 @@
-"""Session-aware markdown note writing to ~/VoiceNotes.
+"""Markdown note writing for standalone takes and named sessions.
 
-Takes that arrive within `session_merge_minutes` of each other merge into one
-note file; longer gaps (or explicit "New Session") start a fresh one.
+- `standalone`: exactly one recording -> one note (`<notes>/<name>.md`).
+  Never includes any other take.
+- `session`: recordings land in `<notes>/<session>/` next to the notes; the
+  session keeps a per-name accumulator (`<state>/sessions/<session>.json`) and
+  every new take re-renders the session files so they keep updating live:
+      <notes>/<session>/summary.md   overview + meta + action items
+      <notes>/<session>/notes.md     detailed markdown notes
+      <notes>/<session>/<topic>.md   one file per big topic (Unit 1, SQLI, ...)
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import threading
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -20,91 +27,114 @@ log = logging.getLogger("resonote.notes")
 _session_lock = threading.Lock()
 
 
-class SessionStore:
-    def __init__(self, cfg: config.Config) -> None:
+def sanitize_name(name: str) -> str:
+    """Filesystem-safe version of a user-chosen name, 'untitled' if empty."""
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", (name or "").strip())
+    while "--" in name:
+        name = name.replace("--", "-")
+    name = name.strip("-. _")
+    if not name:
+        return "untitled"
+    return name[:80]
+
+
+def stamp_name() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def topic_filename(file: str) -> str:
+    """Safe '<name>.md' for a topic ('Unit 1' -> 'Unit-1.md')."""
+    safe = sanitize_name(str(file or "topic"))
+    return f"{safe}.md" if not safe.endswith(".md") else safe
+
+
+class SessionAcc:
+    """Per-session accumulator: takes list + transcripts, persisted atomically."""
+
+    def __init__(self, cfg: config.Config, safe: str, display: str = "") -> None:
         self.cfg = cfg
-        self.state_file = cfg.state_dir / "session.json"
+        self.safe = sanitize_name(safe) or "untitled"
+        self.display = (display or self.safe).strip()
+        self.state_file = cfg.state_dir / "sessions" / f"{self.safe}.json"
         self._state: dict | None = None
 
     def _load(self) -> dict:
         if self._state is not None:
             return self._state
+        default = {
+            "safe": self.safe,
+            "display": self.display,
+            "stamp": None,
+            "created_ts": None,
+            "last_take_ts": None,
+            "takes": [],
+            "segments": [],
+            "bookmarks": [],
+        }
         if self.state_file.exists():
             try:
-                self._state = json.loads(self.state_file.read_text(encoding="utf-8"))
+                loaded = json.loads(self.state_file.read_text(encoding="utf-8"))
             except Exception:  # noqa: BLE001
-                self._state = None
-        if not isinstance(self._state, dict) or "stamp" not in self._state:
-            self._state = {"stamp": None, "last_take_ts": None, "takes": [], "segments": [], "bookmarks": []}
+                loaded = None
+            if isinstance(loaded, dict):
+                loaded = {**default, **loaded, "safe": self.safe}
+                self._state = loaded
+                return self._state
+        self._state = default
         return self._state
 
-    def _write(self) -> None:
-        """Persist state; callers must hold _session_lock."""
+    def _save(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(self._state, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.state_file)
 
-    def reset(self) -> str:
-        """Start a brand-new session; returns its stamp."""
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        with _session_lock:
-            self._state = {"stamp": stamp, "last_take_ts": None, "takes": [], "segments": [], "bookmarks": []}
-            self._write()
-        return stamp
-
-    def session_for(self, take_ts: float, take_id: str, dur: float) -> str:
-        """Return the session stamp this take belongs to (writes the take in)."""
+    def add_take(self, take_id: str, path: str, dur: float, when_ts: float) -> None:
         with _session_lock:
             st = self._load()
-            now = take_ts
-            if st["stamp"] and st["last_take_ts"] is not None:
-                gap = now - st["last_take_ts"]
-                if gap <= self.cfg.session_merge_minutes * 60 and gap >= -5:
-                    pass  # merge into current session
-                else:
-                    self.reset_locked(now)
-            else:
-                self.reset_locked(now)
-            st = self._load()
-            stamp = st["stamp"]
-            st["last_take_ts"] = now
+            if st["created_ts"] is None:
+                st["created_ts"] = when_ts
+                st["stamp"] = datetime.fromtimestamp(when_ts).strftime("%Y-%m-%d_%H-%M-%S")
+            st["last_take_ts"] = max(when_ts, st["last_take_ts"] or 0)
             st["takes"].append({
                 "id": take_id,
                 "dur": round(dur, 1),
-                "when": datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M"),
+                "when": datetime.fromtimestamp(when_ts).strftime("%Y-%m-%d %H:%M"),
+                "when_ts": when_ts,
+                "path": path,
             })
-            self._write()
-            return stamp
+            self._save()
 
-    def reset_locked(self, ts: float) -> None:
-        stamp = datetime.fromtimestamp(ts).strftime("%Y-%m-%d_%H-%M-%S")
-        self._state = {"stamp": stamp, "last_take_ts": ts, "takes": [], "segments": [], "bookmarks": []}
-
-    def append(self, segments: list[dict], bookmarks: list[dict]) -> None:
+    def append_segments(self, segments: list[dict], bookmarks: list[dict], when_ts: float) -> None:
         with _session_lock:
             st = self._load()
-            st["segments"].extend(segments)
+            for s in segments:
+                st["segments"].append({**s, "ts": when_ts})
             for b in bookmarks:
                 if b not in st["bookmarks"]:
                     st["bookmarks"].append(b)
-            self._write()
+            self._save()
 
     def snapshot(self) -> dict:
         with _session_lock:
-            return json.loads(json.dumps(self._load()))
+            st = json.loads(json.dumps(self._load()))
+            st["takes"].sort(key=lambda t: t.get("when_ts", 0))
+            st["segments"].sort(key=lambda s: (s.get("ts", 0), s.get("start", 0)))
+            return st
 
 
-def render_markdown(cfg: config.Config, session: dict, result: dict) -> str:
-    total_secs = sum(t.get("dur", 0) for t in session.get("takes", []))
+def render_standalone(ctx: dict, result: dict) -> str:
+    """Single note for a standalone take (its own content only, no transcript)."""
+    total_secs = sum(t.get("dur", 0) for t in ctx.get("takes", []))
     mins, secs = divmod(int(total_secs), 60)
-    title = (result.get("title") or "Voice Notes").strip()
-    meta = (
-        f"- **Session:** {session.get('stamp')}\n"
-        f"- **Recorded:** {len(session.get('takes', []))} take(s) · {mins}m {secs}s\n"
-    )
+    title = (result.get("title") or ctx.get("display") or ctx.get("safe") or "Voice Notes").strip()
+    meta = f"- **Take:** {ctx.get('stamp') or ctx.get('safe')}\n- **Duration:** {mins}m {secs}s"
 
     out = [f"# {title}", "", f"> {result.get('summary') or ''}".strip(), "", meta.strip(), ""]
+
+    notes = result.get("notes") or ""
+    if notes:
+        out += ["## Notes", "", notes.strip(), ""]
 
     actions = result.get("action_items") or []
     if actions:
@@ -112,8 +142,8 @@ def render_markdown(cfg: config.Config, session: dict, result: dict) -> str:
         out += [f"- [ ] {a}" for a in actions]
         out += [""]
 
-    bookmarks = result.get("bookmarks") or session.get("bookmarks") or []
-    if bookmarks and cfg.keyword_flag:
+    bookmarks = result.get("bookmarks") or ctx.get("bookmarks") or []
+    if bookmarks:
         out += ["## Bookmarks", ""]
         for b in bookmarks:
             if isinstance(b, dict):
@@ -122,37 +152,84 @@ def render_markdown(cfg: config.Config, session: dict, result: dict) -> str:
                 out.append(f"- {b}")
         out += [""]
 
-    notes = result.get("notes") or ""
-    if notes:
-        out += ["## Notes", "", notes.strip(), ""]
-
     speakers = result.get("speakers") or []
     if speakers:
         out += ["## Speakers", ""]
         out += [f"- {s}" for s in speakers]
         out += [""]
 
-    segments = session.get("segments") or []
-    if segments:
-        out += ["## Transcript (raw)", ""]
-        for s in segments:
-            t = _fmt(s.get("start", 0))
-            out.append(f"**[{t}]** {s.get('text', '')}")
-
     return "\n".join(out).rstrip() + "\n"
 
 
-def write_note(cfg: config.Config, session: dict, result: dict) -> Path:
-    md = render_markdown(cfg, session, result)
-    cfg.notes_dir.mkdir(parents=True, exist_ok=True)
-    path = cfg.notes_dir / f"{session['stamp']}_session.md"
-    tmp = path.with_suffix(".md.tmp")
-    tmp.write_text(md, encoding="utf-8")
-    tmp.replace(path)
-    log.info("wrote note -> %s", path)
-    return path
+def render_session(ctx: dict, result: dict) -> dict[str, str]:
+    """Files for a session: summary.md + notes.md + one .md per big topic."""
+    total_secs = sum(t.get("dur", 0) for t in ctx.get("takes", []))
+    mins, secs = divmod(int(total_secs), 60)
+    display = ctx.get("display") or ctx.get("safe") or "Session"
+    summary = (result.get("summary") or "").strip()
+    meta = (
+        f"- **Session:** {display}\n"
+        f"- **Recorded:** {len(ctx.get('takes', []))} take(s) · {mins}m {secs}s\n"
+    )
+
+    summary_lines = [f"# {display}", ""]
+    if summary:
+        summary_lines += [f"> {summary}", ""]
+    summary_lines += [meta.strip(), ""]
+
+    actions = result.get("action_items") or []
+    if actions:
+        summary_lines += ["## Action Items", ""]
+        summary_lines += [f"- [ ] {a}" for a in actions]
+        summary_lines += [""]
+
+    notes = (result.get("notes") or "").strip()
+    notes_md = []
+    if notes:
+        notes_md += [f"# {display} — Notes", "", notes, ""]
+
+    bookmarks = result.get("bookmarks") or ctx.get("bookmarks") or []
+    if bookmarks:
+        notes_md += ["## Bookmarks", ""]
+        for b in bookmarks:
+            if isinstance(b, dict):
+                notes_md.append(f"- **{b.get('time', '')}** {b.get('text', '')}".rstrip())
+            else:
+                notes_md.append(f"- {b}")
+        notes_md += [""]
+
+    speakers = result.get("speakers") or []
+    if speakers:
+        notes_md += ["## Speakers", ""]
+        notes_md += [f"- {s}" for s in speakers]
+        notes_md += [""]
+
+    files = {
+        "summary.md": "\n".join(summary_lines).rstrip() + "\n",
+        "notes.md": "\n".join(notes_md).rstrip() + "\n",
+    }
+    for topic in result.get("topics") or []:
+        content = str(topic.get("content") or "").strip()
+        if not content:
+            continue
+        name = topic_filename(str(topic.get("file") or "topic"))
+        files[name] = f"# {name[:-3]}\n\n{content}\n"
+    return files
 
 
-def _fmt(seconds: float) -> str:
-    s = int(seconds)
-    return f"{s // 60}:{s % 60:02d}"
+def write_files(cfg: config.Config, target_dir: Path, files: dict[str, str]) -> list[Path]:
+    """Write {filename: markdown} atomically into target_dir, returns written paths.
+
+    Concurrent writers (several takes of one session) may target the same file,
+    so the temp name is unique; replace() keeps the write atomic.
+    """
+    target_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for fname, md in files.items():
+        path = target_dir / fname
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(md, encoding="utf-8")
+        tmp.replace(path)
+        written.append(path)
+    log.info("wrote %d note(s) -> %s", len(written), target_dir)
+    return written

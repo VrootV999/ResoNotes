@@ -1,25 +1,29 @@
 # ResoNote — build & feature tracking
 
-- [x] Implement global shortcut listener in Rust (SUPER + SHIFT + J) to toggle recording state
-      (X11/XWayland via `global-hotkey`; Wayland fallback = `resonote toggle` CLI / tray)
-- [x] Build a lightweight system tray UI in Rust with Record/Stop, New Session, Open Notes, and Quit controls
-      (StatusNotifier host required; app keeps working without one)
-- [x] Write the low-latency microphone capture loop in Rust to save raw audio (16-bit PCM WAV, mono, 16 kHz)
-- [x] Set up the Python backend environment and install dependencies for transcription, LLMs, and TTS
-- [x] Write Python script to process audio via free endpoints — Groq (whisper) + Gemini (notes)
-- [x] Implement text-to-speech in Python for real-time background audio feedback (edge-tts, free, no key)
-- [x] Establish IPC between Rust and Python over local HTTP (127.0.0.1, handled by the FastAPI backend)
-- [x] Wire the Rust shortcut/tray action to trigger the Python processing pipeline asynchronously
-- [x] Automatically save generated markdown notes to ~/VoiceNotes/ (session-aware merging in `python/notes.py`)
-- [x] Add offline caching: takes are kept locally and the queue worker retries when the network returns
-      (`python/pipeline.py`, `~/.resonote/queue/`)
-- [x] Build action-item extraction, keyword bookmarks ("note to self"), speaker labelling, and custom
-      prompt switching into the Python logic (see `python/llm.py`, `python/stt.py`)
+- [x] Two recording modes:
+  - Standalone (`SUPER+J` / `resonote toggle`): one recording -> one note, never merged
+  - Session (`SUPER+SHIFT+J` / `resonote session`): takes group under a named session,
+    stored in `recordings/<session>/` and combined into one `~/VoiceNotes/<session>.md`
+- [x] Name prompt before recording (zenity/kdialog/rofi; `RESONOTE_NAME` env override;
+      Enter = date-time) for both session and note names
+- [x] Desktop notification when recording starts (mode + name) and when a take is saved
+- [x] Global shortcuts in Rust (two hotkeys, X11/XWayland) with CLI fallback
+- [x] Lightweight system tray UI in Rust (standalone + session + open notes + quit)
+- [x] Low-latency microphone capture loop in Rust (16-bit PCM WAV, mono, 16 kHz)
+- [x] Python backend: Groq (whisper) transcription + Gemini note generation, TTS
+- [x] Per-session accumulators (`state/sessions/<name>.json`) so a session note re-renders
+      from exactly its own takes (standalone notes are fully isolated)
+- [x] Offline caching: takes + `.meta` sidecar move to `~/.config/resonote/queue/`,
+      the worker retries when the network returns
+- [x] Action-item extraction, keyword bookmarks ("note to self"), speaker labelling
+- [x] Install script, config/example, README,TODO
 
 ## How to run
 
 ```bash
-./install.sh                      # builds Rust, creates ~/.resonote/venv, writes config
-~/.resonote/config.json           # add free GROQ + GEMINI keys
+./install.sh                      # builds Rust, creates ~/.config/resonote/venv, writes config
+~/.config/resonote/config.json    # add free GROQ + GEMINI keys
 ~/.local/bin/resonote             # run the app
 ```
+
+Keys: `SUPER+J` standalone · `SUPER+SHIFT+J` session · tray · `resonote toggle|session|status|quit`

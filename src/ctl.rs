@@ -15,6 +15,7 @@ pub struct Status {
 struct StatusInner {
     pub recording: bool,
     pub backend_up: bool,
+    pub mode: Option<String>,
 }
 
 impl Status {
@@ -27,16 +28,23 @@ impl Status {
     pub fn set_backend(&self, v: bool) {
         self.inner.lock().unwrap().backend_up = v;
     }
-    pub fn is_recording(&self) -> bool {
-        self.inner.lock().unwrap().recording
+    pub fn set_mode(&self, v: Option<&str>) {
+        self.inner.lock().unwrap().mode = v.map(|s| s.to_string());
+    }
+    pub fn mode(&self) -> Option<String> {
+        self.inner.lock().unwrap().mode.clone()
     }
     pub fn line(&self) -> String {
         let s = self.inner.lock().unwrap();
-        format!(
+        let mut out = format!(
             "recording={} backend={}",
             if s.recording { "yes" } else { "no" },
             if s.backend_up { "up" } else { "down" }
-        )
+        );
+        if let Some(m) = &s.mode {
+            out = format!("{out} mode={m}");
+        }
+        out
     }
 }
 
@@ -46,9 +54,9 @@ fn dispatch(line: &str, tx: &Sender<Ev>, status: &Status) -> String {
             let _ = tx.send(Ev::Toggle);
             "toggling".into()
         }
-        "new_session" => {
-            let _ = tx.send(Ev::NewSession);
-            "start new session".into()
+        "session" => {
+            let _ = tx.send(Ev::Session);
+            "opening session menu".into()
         }
         "status" => status.line(),
         "quit" => {

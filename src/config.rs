@@ -17,6 +17,7 @@ struct FileConfig {
     python: Option<String>,
     backend_dir: Option<String>,
     hotkey: Option<String>,
+    name_prompt: Option<String>,
 }
 
 fn expand(p: &str, home: &str) -> PathBuf {
@@ -26,6 +27,32 @@ fn expand(p: &str, home: &str) -> PathBuf {
         PathBuf::from(home)
     } else {
         PathBuf::from(p)
+    }
+}
+
+/// Filesystem-safe version of a user-chosen name ("Meeting / 2" -> "Meeting--2"
+/// sanitized into "Meeting-2"); falls back to "untitled" when empty.
+pub fn safe_name(input: &str) -> String {
+    let mut out: String = input
+        .trim()
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' => c,
+            _ => '-',
+        })
+        .collect();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    let out: String = out
+        .trim_matches(['-', '.', '_'])
+        .chars()
+        .take(80)
+        .collect();
+    if out.is_empty() {
+        "untitled".to_string()
+    } else {
+        out
     }
 }
 
@@ -40,9 +67,9 @@ pub struct Config {
     pub port: u16,
     pub notes_dir: PathBuf,
     pub sample_rate: u32,
-    pub tts_feedback: bool,
     pub python_bin: Option<String>,
     pub backend_dir: PathBuf,
+    pub name_prompt: Option<String>,
 }
 
 impl Config {
@@ -77,9 +104,9 @@ impl Config {
             port: file.port.unwrap_or(DEFAULT_PORT),
             notes_dir,
             sample_rate: file.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE),
-            tts_feedback: file.tts_feedback.unwrap_or(true),
             python_bin,
             backend_dir,
+            name_prompt: file.name_prompt.filter(|n| !n.trim().is_empty()),
             data_dir: data_dir.clone(),
             recordings_dir: data_dir.join("recordings"),
             queue_dir: data_dir.join("queue"),

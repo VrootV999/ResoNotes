@@ -18,6 +18,8 @@
   "keyword_flag": true,
   "tts_feedback": true,
 
+  "name_prompt": "auto",
+
   "python": "",
   "backend_dir": "",
   "player": ""
