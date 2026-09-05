@@ -1,0 +1,24 @@
+[package]
+name = "resonote"
+version = "0.1.0"
+edition = "2021"
+description = "Privacy-conscious voice-to-notes companion: tray + global hotkey recorder, Python backend"
+license = "MIT"
+
+[dependencies]
+cpal = "0.15"
+hound = "3.5"
+tray-item = { version = "0.10", features = ["ksni"] }
+global-hotkey = "0.8"
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+log = "0.4"
+env_logger = "0.11"
+notify-rust = "4"
+libc = "0.2"
+
+[profile.release]
+lto = true
+strip = true
